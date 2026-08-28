@@ -21,7 +21,7 @@ import type { RouteMiddleware } from './composables/router'
 import type { NuxtError } from './composables/error'
 import type { AsyncDataExecuteOptions, AsyncDataRequestStatus, DebouncedReturn } from './composables/asyncData'
 import type { NuxtAppManifestMeta } from './composables/manifest'
-import { traceAsync } from './internal/tracing'
+import { addServerTimingMetric, traceAsync } from './internal/tracing'
 import type { LoadingIndicator } from './composables/loading-indicator'
 import type { RouteAnnouncer } from './composables/route-announcer'
 import type { NuxtAnnouncer } from './composables/announcer'
@@ -90,6 +90,8 @@ export interface NuxtSSRContext extends SSRContext {
   ['~preloadManifest']?: boolean
   /** @internal */
   ['~lazyHydratedModules']?: Set<string>
+  /** @internal */
+  ['~serverTiming']?: Array<{ name: string, duration: number, description?: string }>
 }
 
 export interface NuxtPayload {
@@ -454,15 +456,31 @@ export function registerPluginHooks (nuxtApp: NuxtApp, plugin: Plugin & ObjectPl
 /** @since 3.0.0 */
 export async function applyPlugin (nuxtApp: NuxtApp, plugin: Plugin & ObjectPlugin<any>): Promise<void> {
   if (typeof plugin === 'function') {
+    const pluginName = plugin._name || plugin.name || 'anonymous'
     const run = () => nuxtApp.runWithContext(() => plugin(nuxtApp))
-    const { provide } = await (import.meta.server && tracingChannelNuxt
-      ? traceAsync(
-          'nuxt.plugin',
-          { plugin: { name: plugin._name, parallel: plugin.parallel, dependsOn: plugin.dependsOn } },
-          run,
-        )
-      : run()
-    ) || {}
+    const start = import.meta.server && tracingChannelNuxt ? globalThis.performance.now() : 0
+
+    let pluginResult: Awaited<ReturnType<typeof run>> | undefined
+    try {
+      pluginResult = await (import.meta.server && tracingChannelNuxt
+        ? traceAsync(
+            'nuxt.plugin',
+            { plugin: { name: plugin._name, parallel: plugin.parallel, dependsOn: plugin.dependsOn } },
+            run,
+          )
+        : run()
+      ) || {}
+    } finally {
+      if (import.meta.server && tracingChannelNuxt) {
+        addServerTimingMetric(nuxtApp.ssrContext, {
+          name: `nuxt.plugin.${pluginName}`,
+          duration: globalThis.performance.now() - start,
+          description: `plugin:${pluginName}`,
+        })
+      }
+    }
+
+    const { provide } = pluginResult || {}
     if (provide && typeof provide === 'object') {
       for (const key in provide) {
         nuxtApp.provide(key, provide[key])

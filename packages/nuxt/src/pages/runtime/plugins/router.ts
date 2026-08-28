@@ -12,12 +12,15 @@ import { toArray } from '../utils'
 import { getRouteRules } from '#app/composables/manifest'
 import { defineNuxtPlugin, useRuntimeConfig } from '#app/nuxt'
 import { clearError, createError, isNuxtError, showError, useError } from '#app/composables/error'
+import { addServerTimingMetric, traceAsync } from '#app/internal/tracing'
 import { navigateTo } from '#app/composables/router'
 
 import _routes, { handleHotUpdate } from '#build/routes'
 import routerOptions, { hashMode } from '#build/router.options.mjs'
 // @ts-expect-error virtual file
 import { globalMiddleware, namedMiddleware } from '#build/middleware'
+// @ts-expect-error virtual file
+import { tracingChannelNuxt } from '#build/nuxt.config.mjs'
 // @ts-expect-error virtual file
 import { pageIslandRoutes } from '#build/components.islands.mjs'
 
@@ -231,6 +234,7 @@ const plugin: Plugin<{ router: Router }> = defineNuxtPlugin({
 
         for (const entry of middlewareEntries) {
           const middleware: RouteMiddleware = typeof entry === 'string' ? nuxtApp._middleware.named[entry] || await namedMiddleware[entry]?.().then((r: any) => r.default || r) : entry
+          const middlewareName = typeof entry === 'string' ? entry : middleware?.name || 'anonymous'
 
           if (!middleware) {
             if (import.meta.dev) {
@@ -239,11 +243,20 @@ const plugin: Plugin<{ router: Router }> = defineNuxtPlugin({
             throw new Error(`Unknown route middleware: '${entry}'.`)
           }
 
+          const start = import.meta.server && tracingChannelNuxt ? globalThis.performance.now() : 0
           try {
             if (import.meta.dev) {
               nuxtApp._processingMiddleware = (middleware as any)._path || (typeof entry === 'string' ? entry : true)
             }
-            const result = await nuxtApp.runWithContext(() => middleware(to, from))
+            const runMiddleware = () => nuxtApp.runWithContext(() => middleware(to, from))
+            const result = await (import.meta.server && tracingChannelNuxt
+              ? traceAsync(
+                  'nuxt.middleware',
+                  { middleware: { name: middlewareName }, route: { to: to.path, from: from.path } },
+                  () => Promise.resolve(runMiddleware()),
+                )
+              : runMiddleware()
+            )
             if (import.meta.server || (!nuxtApp.payload.serverRendered && nuxtApp.isHydrating)) {
               if (result === false || result instanceof Error) {
                 const error = result || createError({
@@ -271,6 +284,14 @@ const plugin: Plugin<{ router: Router }> = defineNuxtPlugin({
               await nuxtApp.runWithContext(() => showError(error))
             }
             return error
+          } finally {
+            if (import.meta.server && tracingChannelNuxt) {
+              addServerTimingMetric(nuxtApp.ssrContext, {
+                name: `nuxt.middleware.${middlewareName}`,
+                duration: globalThis.performance.now() - start,
+                description: `middleware:${middlewareName}`,
+              })
+            }
           }
         }
       }
